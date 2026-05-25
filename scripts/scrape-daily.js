@@ -32,6 +32,7 @@ const COOKIE_PATH = process.env.COOKIE_PATH || 'data/cookies.json';
 const HISTORY_PATH = process.env.HISTORY_PATH || 'data/run_history.json';
 const COOLDOWN_MINUTES = parseInt(process.env.COOLDOWN_MINUTES || '30'); // don't run more often than this
 const SCREENSHOT_PATH = process.env.SCREENSHOT_PATH || 'data';
+const MAX_DB_SIZE = 50 * 1024 * 1024; // 50MB max DB size
 const AI_MODEL = process.env.AI_MODEL || MODEL; // allows model override for future swaps
 const AI_URL = process.env.AI_URL || API_URL;   // allows provider swap (OpenAI, etc.)
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
@@ -46,17 +47,34 @@ const SEARCH_URL = `https://www.linkedin.com/ad-library/job/search?keyword=servi
 // ─── Multi-Method Job Extraction ─────────────────────────────
 // Attempts CSS selectors first, falls back to regex, then structured data
 async function extractJobsFromPage(page) {
-  // Method 1: CSS selectors (li with p children — current LinkedIn layout)
+  // Check if LinkedIn returned "No results found"
+  const pageText = await page.evaluate(() => (document.body?.innerText || ''));
+  if (/no\s+results\s+found|no\s+jobs\s+match|0\s+results/i.test(pageText)) {
+    console.error(`  LinkedIn says: no results found for this search`);
+    return [];
+  }
+
+  // Method 1: CSS selectors — look for job cards specifically, not footer links
   let jobs = await page.evaluate(() => {
     const items = document.querySelectorAll('li');
     const found = [];
     items.forEach(li => {
+      // Skip: footer nav, sidebar, header items (no detail URL = not a job)
+      const detailLink = li.querySelector('a[href*="/ad-library/job/detail/"]');
+      if (!detailLink) return; // must have a detail URL to be a real job
+      
       const ps = li.querySelectorAll('p');
       const title = ps[0]?.innerText?.trim();
       const company = ps[1]?.innerText?.trim();
       const location = ps[2]?.innerText?.trim();
-      const link = li.querySelector('a[href*="/ad-library/job/detail/"]')?.href;
-      if (title && company) found.push({ job_title: title, company, location: location || '', detail_url: link || '', method: 'css' });
+      
+      // Skip LinkedIn UI elements
+      const allText = li.innerText || '';
+      if (/^(country|date|search|cookie policy|privacy policy|user agreement|about|accessibility)$/i.test(allText.trim())) return;
+      
+      if (title && company) {
+        found.push({ job_title: title, company, location: location || '', detail_url: detailLink.href, method: 'css' });
+      }
     });
     return found;
   });
@@ -148,8 +166,8 @@ const HEALTH_CHECK_COMPANY = { name: 'Apex Service Partners', expectedST: true }
 
 async function healthCheck() {
   // Quick sanity: ask the model a known question
-  const prompt = `Is "${HEALTH_CHECK_COMPANY.name}" a company that uses ServiceTitan? Return only true or false.`;
-  const body = JSON.stringify({ model: AI_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0, max_tokens: 10 });
+  const prompt = `Answer with ONLY the word "true" or "false". Does Apex Service Partners use ServiceTitan software?`;
+  const body = JSON.stringify({ model: AI_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0, max_tokens: 5 });
   return new Promise((resolve) => {
     const req = https.request(AI_URL, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${API_KEY}` }, timeout: 15000 }, (res) => {
       let d = ''; res.on('data', c => d += c); res.on('end', () => {
@@ -366,102 +384,106 @@ async function main() {
   await loadCookies(context);
 
   // Navigate with domcontentloaded (faster, less likely to timeout than networkidle)
-  await listPage.goto('https://www.linkedin.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
+  await listPage.goto('https://www.linkedin.com/ad-library/job/', { waitUntil: 'domcontentloaded', timeout: 15000 });
   await listPage.waitForTimeout(2000 + Math.random() * 2000);
 
-  // Navigate to search
-  console.error(`  Navigating to: ${SEARCH_URL}`);
-  
-  let pageResponse;
-  try {
-    pageResponse = await listPage.goto(SEARCH_URL, { waitUntil: 'load', timeout: 30000 });
-  } catch (navErr) {
-    console.error(`  ❌ NAVIGATION FAILED: ${navErr.message}`);
-    console.error(`  URL: ${SEARCH_URL}`);
-    console.error(`  Possible: network timeout, DNS failure, or LinkedIn blocking request`);
+  // Interactive search — replicate exactly what works in Chrome DevTools
+  // Step 1: Fill keyword
+  const keywordInput = await listPage.$('input[aria-label*="keyword"]') || await listPage.$('input[placeholder*="keyword"]') || await listPage.$('input');
+  if (keywordInput) {
+    await keywordInput.click();
+    await listPage.waitForTimeout(500);
+    await keywordInput.fill('servicetitan');
+    console.error('  Typed: servicetitan');
   }
-  
-  if (pageResponse) {
-    console.error(`  HTTP: ${pageResponse.status()} ${pageResponse.statusText()}`);
-    if (pageResponse.status() >= 400) {
-      console.error(`  ❌ BLOCKED or ERROR: HTTP ${pageResponse.status()}`);
+
+  // Step 2: Country filter — click, select United States, Done
+  const countryBtn = await listPage.$('button:has-text("Country")');
+  if (countryBtn) {
+    await countryBtn.click();
+    await listPage.waitForTimeout(1000);
+    // Find and click United States checkbox
+    const usCheckbox = await listPage.$('input[type="checkbox"]');
+    if (usCheckbox) {
+      // Navigate through the list to find United States
+      const allCheckboxes = await listPage.$$('input[type="checkbox"]');
+      for (const cb of allCheckboxes) {
+        const label = await cb.evaluate(el => el.parentElement?.innerText || el.nextSibling?.innerText || '');
+        if (label.includes('United States')) {
+          await cb.click();
+          console.error('  Country: United States selected');
+          break;
+        }
+      }
     }
+    await listPage.waitForTimeout(500);
+    // Click Done
+    const doneBtns = await listPage.$$('button:has-text("Done")');
+    if (doneBtns.length > 0) await doneBtns[0].click();
+    await listPage.waitForTimeout(500);
   }
-  
-  await listPage.waitForTimeout(5000 + Math.random() * 3000);
-  
-  // Capture console errors from the page (LinkedIn JS errors, block messages)
-  const pageErrors = [];
-  listPage.on('console', msg => {
-    if (msg.type() === 'error') pageErrors.push(msg.text().substring(0, 200));
+
+  // Step 3: Date filter — click, select Last 30 days, Done
+  const dateBtn = await listPage.$('button:has-text("Date")');
+  if (dateBtn) {
+    await dateBtn.click();
+    await listPage.waitForTimeout(1000);
+    // Select "Last 30 days"
+    const last30 = await listPage.$('input[type="radio"][value*="30"]') || await listPage.$('label:has-text("Last 30 days")');
+    if (last30) {
+      await last30.click();
+      console.error('  Date: Last 30 days selected');
+    }
+    await listPage.waitForTimeout(500);
+    const doneBtns2 = await listPage.$$('button:has-text("Done")');
+    if (doneBtns2.length > 0) await doneBtns2[0].click();
+    await listPage.waitForTimeout(500);
+  }
+
+  // Step 4: Click Search
+  const searchBtn = await listPage.$('button:has-text("Search")');
+  if (searchBtn) {
+    await searchBtn.click();
+    console.error('  Search clicked, waiting for results...');
+    await listPage.waitForTimeout(3000 + Math.random() * 2000);
+  }
+
+  // Verify we got results by checking for count heading
+  const resultHeading = await listPage.evaluate(() => {
+    const h1 = document.querySelector('h1');
+    return h1 ? h1.innerText : 'no heading';
   });
-  listPage.on('pageerror', err => pageErrors.push(err.message.substring(0, 200)));
+  console.error(`  Page heading: "${resultHeading}"`);
   
-  // Full page state diagnostic
+  // Fallback: if search failed, construct URL manually and navigate
+  if (!resultHeading.includes('job') && !resultHeading.includes('match')) {
+    console.error(`  ⚠️ Search form didn't produce results. Using direct URL navigation as fallback...`);
+    await listPage.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await listPage.waitForTimeout(5000 + Math.random() * 3000);
+  }
+
+  // Now do the page diagnostic and scrolling
   const pageState = await listPage.evaluate(() => {
     const items = document.querySelectorAll('li');
-    const headings = document.querySelectorAll('h1, h2');
-    const bodyText = (document.body?.innerText || '').substring(0, 500);
+    const heading = document.querySelector('h1');
     const title = document.title;
-    const url = window.location.href;
-    
-    // Check for common LinkedIn block messages
-    const blockedPhrases = ['unusual activity', 'verify', 'security check', 'captcha', 'sign in', 'log in', 'access denied'];
-    const maybeBlocked = blockedPhrases.some(p => bodyText.toLowerCase().includes(p));
-    
-    // Check for job list elements specifically
-    const jobCards = document.querySelectorAll('[class*="job"], [class*="result"], [class*="card"]');
-    const hasH1 = !!document.querySelector('h1');
-    
+    const bodyText = (document.body?.innerText || '').substring(0, 300);
     return {
-      url,
-      title,
       liCount: items.length,
-      headings: Array.from(headings).map(h => h.innerText).filter(Boolean),
-      bodyPreview: bodyText,
-      maybeBlocked,
-      jobCardElements: jobCards.length,
-      hasH1,
-      htmlLength: document.documentElement.outerHTML.length
+      heading: heading?.innerText || '',
+      title,
+      bodyPreview: bodyText
     };
   });
-  
-  console.error(`  ┌─ Page Diagnostic ─────────────────────────────`);
-  console.error(`  │ URL:      ${pageState.url}`);
-  console.error(`  │ Title:    "${pageState.title}"`);
-  console.error(`  │ HTML:     ${pageState.htmlLength} bytes`);
-  console.error(`  │ <li>:     ${pageState.liCount} | job cards: ${pageState.jobCardElements} | h1: ${pageState.hasH1}`);
-  console.error(`  │ Headings: ${pageState.headings.join(' · ')}`);
-  console.error(`  │ Blocked?  ${pageState.maybeBlocked ? '⚠️ YES — page shows security/block message' : 'no'}`);
-  console.error(`  │ Body:     ${pageState.bodyPreview.substring(0, 120)}`);
-  if (pageErrors.length > 0) {
-    console.error(`  │ JS errors: ${pageErrors.slice(0, 3).join(' | ')}`);
-  }
-  console.error(`  └───────────────────────────────────────────────`);
-  
-  // Retry if page looks empty
-  if (pageState.liCount < 5) {
-    console.error(`  ⚠️ Page sparse (${pageState.liCount} <li>).`);
-    if (pageState.maybeBlocked) {
-      console.error(`  🛑 LinkedIn appears to be blocking — security/verify page detected.`);
-      console.error(`  Suggestions: use residential proxy, reduce frequency, or switch IP`);
-    } else {
-      console.error(`  Waiting 15s for delayed rendering...`);
-      await listPage.waitForTimeout(15000);
-      const retryState = await listPage.evaluate(() => ({
-        liCount: document.querySelectorAll('li').length,
-        body: (document.body?.innerText || '').substring(0, 200),
-        title: document.title
-      }));
-      console.error(`  Retry: ${retryState.liCount} <li>, title: "${retryState.title}", body: ${retryState.body.substring(0, 100)}`);
-    }
-    
-    // Take screenshot so we can SEE what LinkedIn is actually serving
+  console.error(`  Page: "${pageState.title}" | H1: "${pageState.heading}" | <li>: ${pageState.liCount}`);
+
+  if (pageState.liCount < 3) {
+    console.error(`  ⚠️ Page sparse — LinkedIn may have blocked or changed layout`);
     try {
-      const screenFile = `${SCREENSHOT_PATH}/linkedin_page_${endDate}_${Date.now()}.png`;
+      const screenFile = `${SCREENSHOT_PATH}/linkedin_page_${endDate}.png`;
       await listPage.screenshot({ path: screenFile, fullPage: false });
-      console.error(`  📸 Screenshot saved: ${screenFile}`);
-    } catch { console.error(`  📸 Screenshot failed`); }
+      console.error(`  📸 Screenshot: ${screenFile}`);
+    } catch {}
   }
 
   const jobs = [];
