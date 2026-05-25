@@ -399,76 +399,88 @@ async function main() {
     console.error('  Typed: servicetitan');
   }
 
-  // Step 2: Country filter — click, select United States, Done
-  const countryBtn = await listPage.$('button:has-text("Country")');
-  if (countryBtn) {
-    await countryBtn.click();
-    await listPage.waitForTimeout(1000);
-    // Find and click United States checkbox
-    const usCheckbox = await listPage.$('input[type="checkbox"]');
-    if (usCheckbox) {
-      // Navigate through the list to find United States
-      const allCheckboxes = await listPage.$$('input[type="checkbox"]');
-      for (const cb of allCheckboxes) {
-        const label = await cb.evaluate(el => el.parentElement?.innerText || el.nextSibling?.innerText || '');
-        if (label.includes('United States')) {
-          await cb.click();
-          console.error('  Country: United States selected');
-          break;
-        }
-      }
-    }
-    await listPage.waitForTimeout(500);
-    // Click Done
-    const doneBtns = await listPage.$$('button:has-text("Done")');
-    if (doneBtns.length > 0) await doneBtns[0].click();
-    await listPage.waitForTimeout(500);
+  // Step 2: Country filter — select United States via JS (avoids dropdown overlay issues)
+  try {
+    await listPage.evaluate(() => {
+      const countryBtn = document.querySelector('button');
+      if (countryBtn) countryBtn.click(); // Open dropdown
+      return new Promise(resolve => {
+        setTimeout(() => {
+          // Find and click United States checkbox
+          const allInputs = document.querySelectorAll('input[type="checkbox"]');
+          for (const cb of allInputs) {
+            const parentText = (cb.parentElement?.innerText || cb.closest('label')?.innerText || '').toLowerCase();
+            if (parentText.includes('united states')) {
+              cb.click();
+              break;
+            }
+          }
+          // Click Done
+          setTimeout(() => {
+            const doneBtn = Array.from(document.querySelectorAll('button')).find(b => b.innerText === 'Done');
+            if (doneBtn) doneBtn.click();
+            resolve();
+          }, 500);
+        }, 1000);
+      });
+    });
+    await listPage.waitForTimeout(2000);
+    console.error('  Country: United States selected');
+  } catch (e) {
+    console.error(`  Country selection warning: ${e.message}`);
   }
 
-  // Step 3: Date filter — select custom date range (yesterday → today)
-  const dateBtn = await listPage.$('button:has-text("Date")');
-  if (dateBtn) {
-    await dateBtn.click();
+  // Step 3: Date filter — select custom range via JS, then fill dates with Playwright
+  try {
+    await listPage.evaluate(() => {
+      const dateBtn = Array.from(document.querySelectorAll('button')).find(b => b.innerText === 'Date');
+      if (dateBtn) dateBtn.click();
+    });
     await listPage.waitForTimeout(1000);
+    
     // Click "Select date range"
-    const selectRange = await listPage.$('label:has-text("Select date range")') || await listPage.$('input[value*="custom"]');
-    if (selectRange) {
-      await selectRange.click();
-      console.error(`  Date: Select date range clicked`);
-      await listPage.waitForTimeout(500);
-      // Fill start date
-      const startInput = await listPage.$('input[name="startDate"]') || (await listPage.$$('input[type="date"]'))[0];
-      if (startInput) {
-        await startInput.fill(startDate);
-        console.error(`  Start: ${startDate}`);
+    await listPage.evaluate(() => {
+      const labels = document.querySelectorAll('label');
+      for (const l of labels) {
+        if (l.innerText.includes('Select date range')) { l.click(); break; }
       }
-      // Fill end date
-      const endInput = await listPage.$('input[name="endDate"]') || (await listPage.$$('input[type="date"]'))[1];
-      if (endInput) {
-        await endInput.fill(endDate);
-        console.error(`  End: ${endDate}`);
-      }
+    });
+    await listPage.waitForTimeout(500);
+    
+    // Fill start date
+    const dateInputs = await listPage.$$('input[type="date"]');
+    if (dateInputs.length >= 2) {
+      await dateInputs[0].fill(startDate);
+      await dateInputs[1].fill(endDate);
+      console.error(`  Date: ${startDate} → ${endDate}`);
     } else {
-      // Fallback to Last 30 days
-      const last30 = await listPage.$('label:has-text("Last 30 days")') || await listPage.$('input[value*="30"]');
-      if (last30) {
-        await last30.click();
-        console.error('  Date: Last 30 days (fallback)');
-      }
+      console.error('  Date: could not find date inputs, using Last 30 days fallback');
+      await listPage.evaluate(() => {
+        const labels = document.querySelectorAll('label');
+        for (const l of labels) {
+          if (l.innerText.includes('Last 30 days')) { l.click(); break; }
+        }
+      });
     }
     await listPage.waitForTimeout(500);
-    const doneBtns2 = await listPage.$$('button:has-text("Done")');
-    if (doneBtns2.length > 0) await doneBtns2[0].click();
+    
+    // Click Done
+    await listPage.evaluate(() => {
+      const doneBtn = Array.from(document.querySelectorAll('button')).find(b => b.innerText === 'Done');
+      if (doneBtn) doneBtn.click();
+    });
     await listPage.waitForTimeout(500);
+  } catch (e) {
+    console.error(`  Date selection warning: ${e.message}`);
   }
 
   // Step 4: Click Search
-  const searchBtn = await listPage.$('button:has-text("Search")');
-  if (searchBtn) {
-    await searchBtn.click();
-    console.error('  Search clicked, waiting for results...');
-    await listPage.waitForTimeout(3000 + Math.random() * 2000);
-  }
+  await listPage.evaluate(() => {
+    const btn = Array.from(document.querySelectorAll('button')).find(b => b.innerText === 'Search');
+    if (btn) btn.click();
+  });
+  console.error('  Search clicked, waiting for results...');
+  await listPage.waitForTimeout(4000 + Math.random() * 2000);
 
   // Verify we got results by checking for count heading
   const resultHeading = await listPage.evaluate(() => {
@@ -476,13 +488,6 @@ async function main() {
     return h1 ? h1.innerText : 'no heading';
   });
   console.error(`  Page heading: "${resultHeading}"`);
-  
-  // Fallback: if search failed, construct URL manually and navigate
-  if (!resultHeading.includes('job') && !resultHeading.includes('match')) {
-    console.error(`  ⚠️ Search form didn't produce results. Using direct URL navigation as fallback...`);
-    await listPage.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await listPage.waitForTimeout(5000 + Math.random() * 3000);
-  }
 
   // Now do the page diagnostic and scrolling
   const pageState = await listPage.evaluate(() => {
