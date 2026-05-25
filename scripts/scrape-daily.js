@@ -28,6 +28,11 @@ const DAYS = parseInt(process.env.DAYS || '1');
 const DB_PATH = process.env.DB_PATH || 'data/linkedin_companies.json';
 const BLACKLIST_PATH = process.env.BLACKLIST_PATH || 'data/linkedin_blacklist.json';
 const DATA_DIR = process.env.DATA_DIR || 'data';
+const COOKIE_PATH = process.env.COOKIE_PATH || 'data/cookies.json';
+const HISTORY_PATH = process.env.HISTORY_PATH || 'data/run_history.json';
+const MAX_DB_SIZE = 50 * 1024 * 1024; // 50MB max DB size
+const AI_MODEL = process.env.AI_MODEL || MODEL; // allows model override for future swaps
+const AI_URL = process.env.AI_URL || API_URL;   // allows provider swap (OpenAI, etc.)
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 
 const today = new Date();
@@ -37,7 +42,148 @@ const startDate = startDateNum.toISOString().split('T')[0];
 
 const SEARCH_URL = `https://www.linkedin.com/ad-library/job/search?keyword=servicetitan&countries=US&dateOption=custom-date-range&startdate=${startDate}&enddate=${endDate}`;
 
-// ─── DB & Blacklist ──────────────────────────────────────────
+// ─── Multi-Method Job Extraction ─────────────────────────────
+// Attempts CSS selectors first, falls back to regex, then structured data
+async function extractJobsFromPage(page) {
+  // Method 1: CSS selectors (li with p children — current LinkedIn layout)
+  let jobs = await page.evaluate(() => {
+    const items = document.querySelectorAll('li');
+    const found = [];
+    items.forEach(li => {
+      const ps = li.querySelectorAll('p');
+      const title = ps[0]?.innerText?.trim();
+      const company = ps[1]?.innerText?.trim();
+      const location = ps[2]?.innerText?.trim();
+      const link = li.querySelector('a[href*="/ad-library/job/detail/"]')?.href;
+      if (title && company) found.push({ job_title: title, company, location: location || '', detail_url: link || '', method: 'css' });
+    });
+    return found;
+  });
+
+  // Method 2: Fallback — regex extraction from page text
+  if (jobs.length === 0) {
+    jobs = await page.evaluate(() => {
+      const bodyText = document.body?.innerText || '';
+      if (!bodyText || bodyText.length < 100) return [];
+      // Try to parse free-form text: "Job Title\nCompany Name\nLocation" pattern
+      const lines = bodyText.split('\n').map(l => l.trim()).filter(Boolean);
+      const found = [];
+      const linkMatches = bodyText.match(/\/ad-library\/job\/detail\/\d+/g) || [];
+      for (let i = 0; i < lines.length - 2; i++) {
+        const line = lines[i];
+        // Skip header/footer lines
+        if (line.includes('LinkedIn') || line.includes('Job Library') || line.includes('Search') || line.length > 100) continue;
+        const maybeCompany = lines[i + 1] || '';
+        const maybeLocation = lines[i + 2] || '';
+        const detailUrl = linkMatches.find(l => l.includes('detail')) || '';
+        if (maybeCompany.length < 60 && maybeCompany.length > 1) {
+          found.push({ job_title: line, company: maybeCompany, location: maybeLocation, detail_url: detailUrl ? `https://www.linkedin.com${detailUrl}` : '', method: 'regex' });
+          i += 2; // skip next two lines
+        }
+      }
+      return found;
+    });
+  }
+
+  // Method 3: JSON-LD or meta tags
+  if (jobs.length === 0) {
+    jobs = await page.evaluate(() => {
+      try {
+        const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+        const found = [];
+        scripts.forEach(s => {
+          try {
+            const data = JSON.parse(s.innerText);
+            if (data.itemListElement) {
+              data.itemListElement.forEach(item => {
+                if (item.name && item.hiringOrganization?.name) {
+                  found.push({ job_title: item.name, company: item.hiringOrganization.name, location: item.jobLocation || '', detail_url: item.url || '', method: 'jsonld' });
+                }
+              });
+            }
+          } catch {}
+        });
+        return found;
+      } catch { return []; }
+    });
+  }
+
+  return jobs;
+}
+
+// ─── Cookie Persistence ──────────────────────────────────────
+async function loadCookies(context) {
+  try {
+    if (fs.existsSync(COOKIE_PATH)) {
+      const cookies = JSON.parse(fs.readFileSync(COOKIE_PATH, 'utf-8'));
+      await context.addCookies(cookies);
+      console.error(`  Loaded ${cookies.length} cookies — looks like returning user`);
+    }
+  } catch { /* first run — no cookies */ }
+}
+
+async function saveCookies(context) {
+  try {
+    const cookies = await context.cookies();
+    fs.writeFileSync(COOKIE_PATH, JSON.stringify(cookies));
+  } catch { /* non-critical */ }
+}
+
+// ─── Auto-Detect Staffing Agencies ──────────────────────────
+const STAFFING_PATTERNS = [
+  /\brecruiting\b/i, /\bstaffing\b/i, /\btalent\s+acquisition\b/i,
+  /\bplacement\b/i, /\bjob\s+board\b/i, /\brecruitment\b/i,
+  /\bhire\s+on\s+behalf\b/i, /\bclient\s+of\b/i, /\bcontract\s+staffing\b/i
+];
+
+function looksLikeStaffingAgency(description, companyName) {
+  const lower = (companyName || '').toLowerCase();
+  if (lower.includes('staffing') || lower.includes('recruit') || lower.includes('talent')) return true;
+  return STAFFING_PATTERNS.some(p => p.test(description));
+}
+
+// ─── Classification Health Check ────────────────────────────
+const HEALTH_CHECK_COMPANY = { name: 'Apex Service Partners', expectedST: true };
+
+async function healthCheck() {
+  // Quick sanity: ask the model a known question
+  const prompt = `Is "${HEALTH_CHECK_COMPANY.name}" a company that uses ServiceTitan? Return only true or false.`;
+  const body = JSON.stringify({ model: AI_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0, max_tokens: 10 });
+  return new Promise((resolve) => {
+    const req = https.request(AI_URL, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${API_KEY}` }, timeout: 15000 }, (res) => {
+      let d = ''; res.on('data', c => d += c); res.on('end', () => {
+        try {
+          const j = JSON.parse(d);
+          const answer = j.choices?.[0]?.message?.content?.toLowerCase() || '';
+          resolve(answer.includes('true'));
+        } catch { resolve(false); }
+      });
+    });
+    req.on('error', () => resolve(false));
+    req.write(body); req.end();
+  });
+}
+
+// ─── DB Size Guard ──────────────────────────────────────────
+function trimDBIfNeeded(db) {
+  const raw = JSON.stringify(db);
+  if (raw.length > MAX_DB_SIZE) {
+    console.error(`⚠️ DB too large (${(raw.length / 1024 / 1024).toFixed(1)}MB). Trimming oldest entries...`);
+    db.companies = db.companies.slice(-5000); // keep last 5000
+    console.error(`  Trimmed to ${db.companies.length} companies`);
+  }
+}
+
+// ─── Status History ─────────────────────────────────────────
+function logRunStatus(status) {
+  let history = [];
+  if (fs.existsSync(HISTORY_PATH)) {
+    try { history = JSON.parse(fs.readFileSync(HISTORY_PATH, 'utf-8')); } catch {}
+  }
+  history.push({ ...status, timestamp: new Date().toISOString() });
+  if (history.length > 90) history = history.slice(-90); // keep 90 days
+  fs.writeFileSync(HISTORY_PATH, JSON.stringify(history, null, 2));
+}
 function loadJSON(path, fallback) {
   if (fs.existsSync(path)) {
     try { return JSON.parse(fs.readFileSync(path, 'utf-8')); }
@@ -205,6 +351,9 @@ async function main() {
 
   const listPage = await context.newPage();
 
+  // Load previous cookies — makes us look like a returning user
+  await loadCookies(context);
+
   // Navigate with domcontentloaded (faster, less likely to timeout than networkidle)
   await listPage.goto('https://www.linkedin.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
   await listPage.waitForTimeout(2000 + Math.random() * 2000);
@@ -302,19 +451,7 @@ async function main() {
   let prevCount = 0, noNew = 0;
 
   for (let i = 0; i < 80; i++) {
-    const newJobs = await listPage.evaluate(() => {
-      const items = document.querySelectorAll('li');
-      const found = [];
-      items.forEach(li => {
-        const ps = li.querySelectorAll('p');
-        const title = ps[0]?.innerText?.trim();
-        const company = ps[1]?.innerText?.trim();
-        const location = ps[2]?.innerText?.trim();
-        const link = li.querySelector('a[href*="/ad-library/job/detail/"]')?.href;
-        if (title && company) found.push({ job_title: title, company, location: location || '', detail_url: link || '' });
-      });
-      return found;
-    });
+    const newJobs = await extractJobsFromPage(listPage);
 
     for (const j of newJobs) {
       const key = j.job_title + j.company;
@@ -384,6 +521,14 @@ async function main() {
   // ── Phase 4: Open detail pages & classify ──
   console.log(`\n── Phase 4: Opening detail pages & classifying ──`);
   
+  // Classification health check — verify AI model still works before spending credits
+  const aiHealthy = await healthCheck();
+  if (!aiHealthy) {
+    console.error(`  ⚠️ AI health check FAILED — model may be broken or changed. Proceeding with classification anyway.`);
+  } else {
+    console.error(`  ✅ AI health check passed`);
+  }
+  
   let newST = 0, newAZ = 0, blacklisted = 0;
   const classified = [];
 
@@ -412,6 +557,15 @@ async function main() {
     // Classify via DeepSeek
     const result = await classifyJobDescription(c.company_name, c.representative_job, c.location, description);
     
+    // Auto-detect staffing agencies from description text
+    if (!stUser && looksLikeStaffingAgency(description, c.company_name)) {
+      result.st_user = false;
+      result.company_type = 'staffing_agency';
+      result.confidence = 95;
+      result.reasoning = 'Auto-detected: description or company name indicates staffing/recruitment agency';
+      console.log(`  → Auto-detected staffing agency`);
+    }
+
     const stUser = result.st_user === true;
     const inAZ = result.in_arizona === true;
     const companyType = result.company_type || 'unknown';
@@ -433,7 +587,8 @@ async function main() {
         first_job: c.representative_job,
         location: c.location,
         first_seen: endDate,
-        reviewed_at: new Date().toISOString()
+        reviewed_at: new Date().toISOString(),
+        raw_description: description.substring(0, 1000) // store for future re-classification
       });
       newST++;
       if (inAZ) newAZ++;
@@ -461,8 +616,14 @@ async function main() {
   // ── Save ──
   db.last_scrape = new Date().toISOString();
   db.last_updated = new Date().toISOString();
+  trimDBIfNeeded(db);
   saveJSON(DB_PATH, db);
   saveJSON(BLACKLIST_PATH, blacklist);
+  
+  // Persist cookies for next run (looks like returning user)
+  await saveCookies(context);
+  await context.close();
+  await browser.close();
 
   // ── Generate XLSX Report ──
   const confirmedRows = db.companies.map(c => ({
@@ -608,15 +769,28 @@ async function main() {
   console.log(`\nDone.`);
 
   // ── Run Status Summary ──
-  const status = [];
-  status.push(jobs.length > 0 ? `✅ Scraped ${jobs.length} jobs` : `❌ Scraped 0 jobs (LinkedIn may have blocked or page changed)`);
-  status.push(newST > 0 ? `✅ ${newST} new ST users confirmed` : `⚪ No new ST users today`);
-  status.push(newAZ > 0 ? `🚨 ${newAZ} in Arizona` : `⚪ No AZ companies`);
-  status.push(blacklisted > 0 ? `🚫 ${blacklisted} blacklisted` : `⚪ None blacklisted`);
-  if (WEBHOOK_URL) status.push(`📧 Webhook sent`);
+  const status = {
+    date: endDate,
+    jobs_scraped: jobs.length,
+    companies_checked: companies.length,
+    new_st_users: newST,
+    new_az: newAZ,
+    blacklisted,
+    db_total: db.companies.length,
+    extraction_method: jobs.length > 0 ? jobs[0].method : 'none',
+    ai_healthy: aiHealthy,
+    webhook_sent: !!WEBHOOK_URL
+  };
 
   console.log(`\n=== STATUS ===`);
-  status.forEach(s => console.log(s));
+  console.log(`✅ Scraped ${jobs.length} jobs` + (jobs.length === 0 ? ` ⚠️ (page may have changed or blocking)` : ''));
+  console.log(`${newST > 0 ? '✅' : '⚪'} ${newST} new ST users confirmed`);
+  console.log(`${newAZ > 0 ? '🚨' : '⚪'} ${newAZ} in Arizona`);
+  console.log(`${blacklisted > 0 ? '🚫' : '⚪'} ${blacklisted} blacklisted`);
+  console.log(`${WEBHOOK_URL ? '📧' : '⚪'} Webhook ${WEBHOOK_URL ? 'sent' : 'skipped (no URL)'}`);
+  console.log(`🧠 AI healthy: ${aiHealthy}`);
+  
+  logRunStatus(status);
 }
 
 main().catch(err => {
