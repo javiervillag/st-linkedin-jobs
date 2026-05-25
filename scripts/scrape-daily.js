@@ -28,6 +28,7 @@ const DAYS = parseInt(process.env.DAYS || '1');
 const DB_PATH = process.env.DB_PATH || 'data/linkedin_companies.json';
 const BLACKLIST_PATH = process.env.BLACKLIST_PATH || 'data/linkedin_blacklist.json';
 const DATA_DIR = process.env.DATA_DIR || 'data';
+const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 
 const today = new Date();
 const endDate = today.toISOString().split('T')[0];
@@ -423,6 +424,56 @@ async function main() {
   const xlsxPath = `${DATA_DIR}/linkedin_report_${endDate}.xlsx`;
   XLSX.writeFile(wb, xlsxPath);
   console.log(`\nXLSX saved: ${xlsxPath}`);
+
+  // ── Send to Webhook ──
+  if (WEBHOOK_URL) {
+    const azList = db.companies.filter(c => c.in_arizona && c.st_user);
+    
+    const payload = JSON.stringify({
+      date: endDate,
+      jobs_scraped: jobs.length,
+      companies_checked: companies.length,
+      new_st_users: newST,
+      new_az_st_users: newAZ,
+      blacklisted_today: blacklisted,
+      db_total: db.companies.length,
+      db_az_st_users: azList.length,
+      new_confirmed: db.companies
+        .filter(c => c.first_seen === endDate && c.st_user)
+        .map(c => ({
+          company: c.company_name,
+          domain: c.domain,
+          location: c.location,
+          job: c.first_job,
+          confidence: c.confidence,
+          insight: c.reasoning
+        })),
+      az_confirmed: db.companies
+        .filter(c => c.in_arizona && c.st_user)
+        .map(c => ({
+          company: c.company_name,
+          domain: c.domain,
+          location: c.location,
+          job: c.first_job,
+          date: (c.reviewed_at || c.first_seen || '').split('T')[0]
+        }))
+    });
+
+    try {
+      const webhookReq = https.request(WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 15000
+      }, (res) => {
+        console.log(`Webhook sent: ${res.statusCode}`);
+      });
+      webhookReq.on('error', (e) => console.error('Webhook failed:', e.message));
+      webhookReq.write(payload);
+      webhookReq.end();
+    } catch (e) {
+      console.error('Webhook error:', e.message);
+    }
+  }
 
   // ── Report ──
   const azList = db.companies.filter(c => c.in_arizona && c.st_user);
