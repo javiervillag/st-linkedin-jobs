@@ -30,7 +30,8 @@ const BLACKLIST_PATH = process.env.BLACKLIST_PATH || 'data/linkedin_blacklist.js
 const DATA_DIR = process.env.DATA_DIR || 'data';
 const COOKIE_PATH = process.env.COOKIE_PATH || 'data/cookies.json';
 const HISTORY_PATH = process.env.HISTORY_PATH || 'data/run_history.json';
-const MAX_DB_SIZE = 50 * 1024 * 1024; // 50MB max DB size
+const COOLDOWN_MINUTES = parseInt(process.env.COOLDOWN_MINUTES || '30'); // don't run more often than this
+const SCREENSHOT_PATH = process.env.SCREENSHOT_PATH || 'data';
 const AI_MODEL = process.env.AI_MODEL || MODEL; // allows model override for future swaps
 const AI_URL = process.env.AI_URL || API_URL;   // allows provider swap (OpenAI, etc.)
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
@@ -312,6 +313,16 @@ async function main() {
 
   const db = loadJSON(DB_PATH, { companies: [] });
   const blacklist = loadJSON(BLACKLIST_PATH, []);
+
+  // ── Cooldown guard ──
+  const lastRun = db.last_scrape ? new Date(db.last_scrape).getTime() : 0;
+  const msSinceLastRun = Date.now() - lastRun;
+  if (msSinceLastRun < COOLDOWN_MINUTES * 60 * 1000) {
+    const waitMin = Math.ceil((COOLDOWN_MINUTES * 60 * 1000 - msSinceLastRun) / 60000);
+    console.log(`⏳ Cooldown: last run ${waitMin}min ago — skipping (min interval: ${COOLDOWN_MINUTES}min)`);
+    console.log(JSON.stringify({ status: 'cooldown', next_run_in_minutes: waitMin }));
+    return;
+  }
   
   console.log(`DB: ${db.companies.length} companies | Blacklist: ${blacklist.length}`);
 
@@ -444,6 +455,13 @@ async function main() {
       }));
       console.error(`  Retry: ${retryState.liCount} <li>, title: "${retryState.title}", body: ${retryState.body.substring(0, 100)}`);
     }
+    
+    // Take screenshot so we can SEE what LinkedIn is actually serving
+    try {
+      const screenFile = `${SCREENSHOT_PATH}/linkedin_page_${endDate}_${Date.now()}.png`;
+      await listPage.screenshot({ path: screenFile, fullPage: false });
+      console.error(`  📸 Screenshot saved: ${screenFile}`);
+    } catch { console.error(`  📸 Screenshot failed`); }
   }
 
   const jobs = [];
