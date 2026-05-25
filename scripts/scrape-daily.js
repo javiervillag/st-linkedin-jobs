@@ -42,7 +42,9 @@ const endDate = today.toISOString().split('T')[0];
 const startDateNum = new Date(today.getTime() - DAYS * 86400000);
 const startDate = startDateNum.toISOString().split('T')[0];
 
-const SEARCH_URL = `https://www.linkedin.com/ad-library/job/search?keyword=servicetitan&countries=US&dateOption=custom-date-range&startdate=${startDate}&enddate=${endDate}`;
+  const SEARCH_URL = `https://www.linkedin.com/ad-library/job/search?keyword=servicetitan&countries=US&dateOption=custom-date-range&startdate=${startDate}&enddate=${endDate}`;
+  console.error(`  Date range: ${startDate} → ${endDate}`);
+  console.error(`  URL: ${SEARCH_URL}`);
 
 // ─── Multi-Method Job Extraction ─────────────────────────────
 // Attempts CSS selectors first, falls back to regex, then structured data
@@ -423,16 +425,36 @@ async function main() {
     await listPage.waitForTimeout(500);
   }
 
-  // Step 3: Date filter — click, select Last 30 days, Done
+  // Step 3: Date filter — select custom date range (yesterday → today)
   const dateBtn = await listPage.$('button:has-text("Date")');
   if (dateBtn) {
     await dateBtn.click();
     await listPage.waitForTimeout(1000);
-    // Select "Last 30 days"
-    const last30 = await listPage.$('input[type="radio"][value*="30"]') || await listPage.$('label:has-text("Last 30 days")');
-    if (last30) {
-      await last30.click();
-      console.error('  Date: Last 30 days selected');
+    // Click "Select date range"
+    const selectRange = await listPage.$('label:has-text("Select date range")') || await listPage.$('input[value*="custom"]');
+    if (selectRange) {
+      await selectRange.click();
+      console.error(`  Date: Select date range clicked`);
+      await listPage.waitForTimeout(500);
+      // Fill start date
+      const startInput = await listPage.$('input[name="startDate"]') || (await listPage.$$('input[type="date"]'))[0];
+      if (startInput) {
+        await startInput.fill(startDate);
+        console.error(`  Start: ${startDate}`);
+      }
+      // Fill end date
+      const endInput = await listPage.$('input[name="endDate"]') || (await listPage.$$('input[type="date"]'))[1];
+      if (endInput) {
+        await endInput.fill(endDate);
+        console.error(`  End: ${endDate}`);
+      }
+    } else {
+      // Fallback to Last 30 days
+      const last30 = await listPage.$('label:has-text("Last 30 days")') || await listPage.$('input[value*="30"]');
+      if (last30) {
+        await last30.click();
+        console.error('  Date: Last 30 days (fallback)');
+      }
     }
     await listPage.waitForTimeout(500);
     const doneBtns2 = await listPage.$$('button:has-text("Done")');
