@@ -32,7 +32,8 @@ const COOKIE_PATH = process.env.COOKIE_PATH || 'data/cookies.json';
 const HISTORY_PATH = process.env.HISTORY_PATH || 'data/run_history.json';
 const COOLDOWN_MINUTES = parseInt(process.env.COOLDOWN_MINUTES || '30'); // don't run more often than this
 const SCREENSHOT_PATH = process.env.SCREENSHOT_PATH || 'data';
-const MAX_DB_SIZE = 50 * 1024 * 1024; // 50MB max DB size
+const MAX_DB_SIZE = 50 * 1024 * 1024;
+const INTERVAL_MINUTES = parseInt(process.env.INTERVAL_MINUTES || '0'); // 0 = run once and exit, >0 = daemon mode
 const AI_MODEL = process.env.AI_MODEL || MODEL; // allows model override for future swaps
 const AI_URL = process.env.AI_URL || API_URL;   // allows provider swap (OpenAI, etc.)
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
@@ -327,12 +328,61 @@ Return ONLY this JSON (no markdown, no explanation):
   });
 }
 
+// ─── Batch DeepSeek Classification ─────────────────────────
+async function classifyBatchWithDeepSeek(companyListText, companies) {
+  if (!API_KEY || !companyListText) return companies.map(c => ({ ...c, st_user: false, company_type: 'unknown' }));
+
+  const prompt = `Classify each company below. For each, determine if they are a confirmed ServiceTitan user based on the job they posted.
+
+Company format: "Company Name" | "Job Title" | Location
+
+Rules:
+- st_user: true if the job TITLE strongly suggests the hiring company uses ServiceTitan (e.g., "ServiceTitan Expert", "HVAC Service Manager", "Dispatcher", "Service Operations Manager", "ServiceTitan Optimization Manager")
+- st_user: false if the company is clearly a staffing agency (Jobot, Talent Harbor, Robert Half, W3Global, etc.), a SaaS company, or not home service
+- company_type: "home_service" | "staffing_agency" | "saas_company" | "other"
+- in_arizona: true if location mentions Phoenix, Tucson, Mesa, Scottsdale, Gilbert, Chandler, Glendale, Tempe, Peoria, Surprise, Yuma, Flagstaff, AZ, or Arizona
+- confidence: 80-100 for definitive matches, 60-80 for likely matches
+- reasoning: one brief sentence
+- domain: likely domain (e.g., "companyname.com")
+
+Companies:
+${companyListText}
+
+Return ONLY a JSON array: [{"company_name":"...","company_type":"...","st_user":true|false,"in_arizona":true|false,"confidence":80,"reasoning":"...","domain":"..."}]`;
+
+  const body = JSON.stringify({ model: AI_MODEL, messages: [{ role: 'user', content: prompt }], temperature: 0, max_tokens: 3000 });
+
+  return new Promise((resolve) => {
+    const req = https.request(AI_URL, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${API_KEY}` }, timeout: 30000 }, (res) => {
+      let d = ''; res.on('data', c => d += c); res.on('end', () => {
+        try {
+          const j = JSON.parse(d);
+          const content = j.choices?.[0]?.message?.content || '';
+          const match = content.match(/```(?:json)?\s*([\s\S]*?)```/) || content.match(/\[[\s\S]*\]/);
+          if (match) {
+            const classified = JSON.parse(match[1] || match[0]);
+            // Map back to original companies by matching company name
+            const result = companies.map(c => {
+              const found = classified.find(cl => cl.company_name === c.company_name) || {};
+              return { ...c, ...found };
+            });
+            resolve(result);
+          } else { resolve(companies); }
+        } catch (e) { console.error('API parse error:', e.message); resolve(companies); }
+      });
+    });
+    req.on('error', (e) => { console.error('API error:', e.message); resolve(companies); });
+    req.write(body); req.end();
+  });
+}
+
 // ─── Main ────────────────────────────────────────────────────
 async function main() {
   console.log(`\n=== LINKEDIN ST DISCOVERY (${startDate} → ${endDate}) ===\n`);
 
   const db = loadJSON(DB_PATH, { companies: [] });
   const blacklist = loadJSON(BLACKLIST_PATH, []);
+  let newST = 0, newAZ = 0, blacklisted = 0;
 
   // ── Cooldown guard ──
   const lastRun = db.last_scrape ? new Date(db.last_scrape).getTime() : 0;
@@ -385,156 +435,48 @@ async function main() {
   // Load previous cookies — makes us look like a returning user
   await loadCookies(context);
 
-  // Navigate with domcontentloaded (faster, less likely to timeout than networkidle)
-  await listPage.goto('https://www.linkedin.com/ad-library/job/', { waitUntil: 'domcontentloaded', timeout: 15000 });
-  await listPage.waitForTimeout(2000 + Math.random() * 2000);
-
-  // Interactive search — replicate exactly what works in Chrome DevTools
-  // Step 1: Fill keyword
-  const keywordInput = await listPage.$('input[aria-label*="keyword"]') || await listPage.$('input[placeholder*="keyword"]') || await listPage.$('input');
-  if (keywordInput) {
-    await keywordInput.click();
-    await listPage.waitForTimeout(500);
-    await keywordInput.fill('servicetitan');
-    console.error('  Typed: servicetitan');
-  }
-
-  // Step 2: Country filter — select United States via JS (avoids dropdown overlay issues)
-  try {
-    await listPage.evaluate(() => {
-      const countryBtn = document.querySelector('button');
-      if (countryBtn) countryBtn.click(); // Open dropdown
-      return new Promise(resolve => {
-        setTimeout(() => {
-          // Find and click United States checkbox
-          const allInputs = document.querySelectorAll('input[type="checkbox"]');
-          for (const cb of allInputs) {
-            const parentText = (cb.parentElement?.innerText || cb.closest('label')?.innerText || '').toLowerCase();
-            if (parentText.includes('united states')) {
-              cb.click();
-              break;
-            }
-          }
-          // Click Done
-          setTimeout(() => {
-            const doneBtn = Array.from(document.querySelectorAll('button')).find(b => b.innerText === 'Done');
-            if (doneBtn) doneBtn.click();
-            resolve();
-          }, 500);
-        }, 1000);
-      });
-    });
-    await listPage.waitForTimeout(2000);
-    console.error('  Country: United States selected');
-  } catch (e) {
-    console.error(`  Country selection warning: ${e.message}`);
-  }
-
-  // Step 3: Date filter — select custom range via JS, then fill dates with Playwright
-  try {
-    await listPage.evaluate(() => {
-      const dateBtn = Array.from(document.querySelectorAll('button')).find(b => b.innerText === 'Date');
-      if (dateBtn) dateBtn.click();
-    });
+  // ── Phase 1: Direct URL (fast) ──
+  console.log(`\n── Phase 1: Loading job list ──`);
+  
+  // Just navigate directly — no interactive form needed
+  await listPage.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
+  await listPage.waitForTimeout(2000);
+  
+  // Check what we got
+  const check = await listPage.evaluate(() => ({
+    heading: document.querySelector('h1')?.innerText || '',
+    liCount: document.querySelectorAll('li').length,
+    jobLinks: document.querySelectorAll('a[href*="/ad-library/job/detail/"]').length
+  }));
+  console.error(`  H1: "${check.heading}" | <li>: ${check.liCount} | detail links: ${check.jobLinks}`);
+  
+  // If no jobs, try one scroll to trigger lazy loading
+  if (check.jobLinks < 2) {
+    await listPage.evaluate(() => window.scrollBy(0, 800));
     await listPage.waitForTimeout(1000);
-    
-    // Click "Select date range"
-    await listPage.evaluate(() => {
-      const labels = document.querySelectorAll('label');
-      for (const l of labels) {
-        if (l.innerText.includes('Select date range')) { l.click(); break; }
+  }
+  
+  // Extract only real job listings (must have detail URL link)
+  const jobs = await listPage.evaluate(() => {
+    const items = document.querySelectorAll('a[href*="/ad-library/job/detail/"]');
+    const found = [];
+    const seen = new Set();
+    items.forEach(link => {
+      const card = link.closest('li') || link.parentElement?.closest('li') || link;
+      const ps = (card.querySelectorAll('p') || link.parentElement?.querySelectorAll('p'));
+      const title = ps[0]?.innerText?.trim() || '';
+      const company = ps[1]?.innerText?.trim() || '';
+      const location = ps[2]?.innerText?.trim() || '';
+      if (!title || !company) return;
+      const key = title + company;
+      if (!seen.has(key)) {
+        seen.add(key);
+        found.push({ job_title: title, company, location, detail_url: link.href });
       }
     });
-    await listPage.waitForTimeout(500);
-    
-    // Fill start date
-    const dateInputs = await listPage.$$('input[type="date"]');
-    if (dateInputs.length >= 2) {
-      await dateInputs[0].fill(startDate);
-      await dateInputs[1].fill(endDate);
-      console.error(`  Date: ${startDate} → ${endDate}`);
-    } else {
-      console.error('  Date: could not find date inputs, using Last 30 days fallback');
-      await listPage.evaluate(() => {
-        const labels = document.querySelectorAll('label');
-        for (const l of labels) {
-          if (l.innerText.includes('Last 30 days')) { l.click(); break; }
-        }
-      });
-    }
-    await listPage.waitForTimeout(500);
-    
-    // Click Done
-    await listPage.evaluate(() => {
-      const doneBtn = Array.from(document.querySelectorAll('button')).find(b => b.innerText === 'Done');
-      if (doneBtn) doneBtn.click();
-    });
-    await listPage.waitForTimeout(500);
-  } catch (e) {
-    console.error(`  Date selection warning: ${e.message}`);
-  }
-
-  // Step 4: Click Search
-  await listPage.evaluate(() => {
-    const btn = Array.from(document.querySelectorAll('button')).find(b => b.innerText === 'Search');
-    if (btn) btn.click();
+    return found;
   });
-  console.error('  Search clicked, waiting for results...');
-  await listPage.waitForTimeout(4000 + Math.random() * 2000);
-
-  // Verify we got results by checking for count heading
-  const resultHeading = await listPage.evaluate(() => {
-    const h1 = document.querySelector('h1');
-    return h1 ? h1.innerText : 'no heading';
-  });
-  console.error(`  Page heading: "${resultHeading}"`);
-
-  // Now do the page diagnostic and scrolling
-  const pageState = await listPage.evaluate(() => {
-    const items = document.querySelectorAll('li');
-    const heading = document.querySelector('h1');
-    const title = document.title;
-    const bodyText = (document.body?.innerText || '').substring(0, 300);
-    return {
-      liCount: items.length,
-      heading: heading?.innerText || '',
-      title,
-      bodyPreview: bodyText
-    };
-  });
-  console.error(`  Page: "${pageState.title}" | H1: "${pageState.heading}" | <li>: ${pageState.liCount}`);
-
-  if (pageState.liCount < 3) {
-    console.error(`  ⚠️ Page sparse — LinkedIn may have blocked or changed layout`);
-    try {
-      const screenFile = `${SCREENSHOT_PATH}/linkedin_page_${endDate}.png`;
-      await listPage.screenshot({ path: screenFile, fullPage: false });
-      console.error(`  📸 Screenshot: ${screenFile}`);
-    } catch {}
-  }
-
-  const jobs = [];
-  const seen = new Set();
-  let prevCount = 0, noNew = 0;
-
-  for (let i = 0; i < 80; i++) {
-    const newJobs = await extractJobsFromPage(listPage);
-
-    for (const j of newJobs) {
-      const key = j.job_title + j.company;
-      if (!seen.has(key)) { seen.add(key); jobs.push(j); }
-    }
-
-    // Human-like scroll: random distance, random delay
-    const scrollAmount = 300 + Math.random() * 700;
-    await listPage.evaluate((s) => window.scrollBy(0, s), scrollAmount);
-    await listPage.waitForTimeout(1200 + Math.random() * 1500);
-
-    if (jobs.length === prevCount) { noNew++; if (noNew >= 5) break; }
-    else { noNew = 0; }
-    prevCount = jobs.length;
-  }
-
+  
   await listPage.close();
   console.log(`Scraped ${jobs.length} jobs`);
 
@@ -585,96 +527,47 @@ async function main() {
   companies.sort((a, b) => (b.maybe_az ? 1 : 0) - (a.maybe_az ? 1 : 0));
   console.log(`Unique companies to check: ${companies.length} (${companies.filter(c => c.maybe_az).length} maybe AZ)`);
 
-  // ── Phase 4: Open detail pages & classify ──
-  console.log(`\n── Phase 4: Opening detail pages & classifying ──`);
+  // ── Phase 4: Batch classify (fast, single API call) ──
+  console.log(`\n── Phase 4: Classifying ${companies.length} companies via AI ──`);
   
-  // Classification health check — verify AI model still works before spending credits
-  const aiHealthy = await healthCheck();
-  if (!aiHealthy) {
-    console.error(`  ⚠️ AI health check FAILED — model may be broken or changed. Proceeding with classification anyway.`);
+  if (companies.length === 0) {
+    console.log('No new companies to classify.');
+  } else if (!API_KEY) {
+    console.error('No API key — skipping classification');
   } else {
-    console.error(`  ✅ AI health check passed`);
-  }
-  
-  let newST = 0, newAZ = 0, blacklisted = 0;
-  const classified = [];
+    const batchText = companies.map(c =>
+      `"${c.company_name}" | "${c.representative_job}" | ${c.location}`
+    ).join('\n');
 
-  for (let i = 0; i < companies.length; i++) {
-    const c = companies[i];
-    if (!c.detail_url) {
-      console.log(`[${i + 1}/${companies.length}] ${c.company_name} — NO DETAIL URL, skipping`);
-      continue;
+    const result = await classifyBatchWithDeepSeek(batchText, companies);
+
+    for (const item of result) {
+      if (item.st_user === true && item.company_type === 'home_service') {
+        db.companies.push({
+          company_name: item.company_name,
+          company_type: item.company_type,
+          st_user: true,
+          in_arizona: item.in_arizona || false,
+          confidence: item.confidence || 80,
+          reasoning: item.reasoning || '',
+          domain: item.domain || (item.company_name?.toLowerCase().replace(/[^a-z0-9]/g, '') + '.com'),
+          first_job: item.representative_job,
+          location: item.location,
+          first_seen: endDate,
+          reviewed_at: new Date().toISOString()
+        });
+        newST++;
+        if (item.in_arizona) newAZ++;
+      } else if (!item.st_user && (item.confidence || 0) >= 80) {
+        blacklist.push({
+          name: item.company_name,
+          reason: item.reasoning || 'AI classified as non-ST',
+          company_type: item.company_type || 'unknown',
+          added: new Date().toISOString()
+        });
+        blacklisted++;
+      }
     }
-
-    console.log(`[${i + 1}/${companies.length}] ${c.company_name} | "${c.representative_job}" | ${c.location}`);
-    
-    // Open detail page using same context (maintains cookies, looks natural)
-    const detailPage = await context.newPage();
-    const description = await extractJobDescription(detailPage, c.detail_url);
-    await detailPage.close();
-
-    if (!description || description.startsWith('ERROR')) {
-      console.log(`  → SKIP: ${description || 'no description'}`);
-      classified.push({ ...c, st_user: false, company_type: 'unknown', reason: 'no_description' });
-      continue;
-    }
-
-    console.log(`  → Description: ${description.substring(0, 100)}...`);
-
-    // Classify via DeepSeek
-    const result = await classifyJobDescription(c.company_name, c.representative_job, c.location, description);
-    
-    // Auto-detect staffing agencies from description text
-    if (!stUser && looksLikeStaffingAgency(description, c.company_name)) {
-      result.st_user = false;
-      result.company_type = 'staffing_agency';
-      result.confidence = 95;
-      result.reasoning = 'Auto-detected: description or company name indicates staffing/recruitment agency';
-      console.log(`  → Auto-detected staffing agency`);
-    }
-
-    const stUser = result.st_user === true;
-    const inAZ = result.in_arizona === true;
-    const companyType = result.company_type || 'unknown';
-    const confidence = result.confidence || 0;
-    const domain = result.domain || (c.company_name?.toLowerCase().replace(/[^a-z0-9]/g, '') + '.com');
-
-    console.log(`  → ST: ${stUser} | Type: ${companyType} | AZ: ${inAZ} | ${confidence}% | ${result.reasoning}`);
-
-    // If confirmed ST user → add to DB
-    if (stUser && companyType === 'home_service') {
-      db.companies.push({
-        company_name: c.company_name,
-        company_type: companyType,
-        st_user: true,
-        in_arizona: inAZ,
-        confidence,
-        reasoning: result.reasoning,
-        domain,
-        first_job: c.representative_job,
-        location: c.location,
-        first_seen: endDate,
-        reviewed_at: new Date().toISOString(),
-        raw_description: description.substring(0, 1000) // store for future re-classification
-      });
-      newST++;
-      if (inAZ) newAZ++;
-    } 
-    // If definitely NOT a ST user (staffing agency, other, false with high confidence)
-    else if (!stUser && confidence >= 80) {
-      blacklist.push({
-        name: c.company_name,
-        reason: result.reasoning,
-        company_type: companyType,
-        added: new Date().toISOString()
-      });
-      blacklisted++;
-    }
-
-    classified.push({ ...c, ...result, domain });
-
-    // Human-like delay between detail pages (prevents rate limiting)
-    await new Promise(r => setTimeout(r, 3000 + Math.random() * 4000));
   }
 
   await context.close();
@@ -858,9 +751,38 @@ async function main() {
   console.log(`🧠 AI healthy: ${aiHealthy}`);
   
   logRunStatus(status);
+  
+  return { browser, context, db, blacklist, newST, newAZ, blacklisted };
 }
 
-main().catch(err => {
-  console.error('FATAL:', err.message);
-  process.exit(1);
-});
+// ─── Daemon mode: keep browser alive, run on interval ──────
+const runPipeline = main; // main IS the pipeline
+
+if (INTERVAL_MINUTES > 0) {
+  console.log(`🔄 Daemon mode: running every ${INTERVAL_MINUTES} minutes. Keep browser alive.`);
+  let state = { browser: null, context: null, firstRun: true };
+  
+  const cycle = async () => {
+    try {
+      console.log(`\n⏰ Cycle at ${new Date().toISOString()}`);
+      state = await runPipeline();
+      console.log(`  Next run in ${INTERVAL_MINUTES} minutes`);
+    } catch (e) {
+      console.error(`Cycle error: ${e.message}`);
+      // Close old browser if it exists
+      if (state.browser) await state.browser.close().catch(() => {});
+      state = { browser: null, context: null };
+    }
+  };
+  
+  // Run first cycle immediately, then on interval
+  cycle().then(() => {
+    setInterval(cycle, INTERVAL_MINUTES * 60 * 1000);
+  });
+} else {
+  // Single run mode (current behavior)
+  runPipeline().catch(err => {
+    console.error('FATAL:', err.message);
+    process.exit(1);
+  });
+}
