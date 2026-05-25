@@ -209,9 +209,16 @@ async function main() {
   await listPage.goto('https://www.linkedin.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
   await listPage.waitForTimeout(2000 + Math.random() * 2000);
 
-  // Navigate to actual search — looks like a human clicking through
-  await listPage.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await listPage.waitForTimeout(3000 + Math.random() * 2000);
+  // Navigate to actual search — wait longer for dynamic job list to render
+  await listPage.goto(SEARCH_URL, { waitUntil: 'load', timeout: 30000 });
+  await listPage.waitForTimeout(5000 + Math.random() * 3000);
+  
+  // Verify page loaded with content
+  const initialCount = await listPage.evaluate(() => {
+    const items = document.querySelectorAll('li');
+    return items.length;
+  });
+  console.error(`  Page loaded, initial elements: ${initialCount}`);
 
   const jobs = [];
   const seen = new Set();
