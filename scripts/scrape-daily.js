@@ -213,12 +213,32 @@ async function main() {
   await listPage.goto(SEARCH_URL, { waitUntil: 'load', timeout: 30000 });
   await listPage.waitForTimeout(5000 + Math.random() * 3000);
   
-  // Verify page loaded with content
-  const initialCount = await listPage.evaluate(() => {
+  // Verify page loaded with content — capture page state for debugging
+  const pageState = await listPage.evaluate(() => {
     const items = document.querySelectorAll('li');
-    return items.length;
+    const headings = document.querySelectorAll('h1, h2');
+    const bodySnippet = (document.body?.innerText || '').substring(0, 300);
+    return {
+      liCount: items.length,
+      headings: Array.from(headings).map(h => h.innerText).filter(Boolean),
+      bodyPreview: bodySnippet,
+      url: window.location.href
+    };
   });
-  console.error(`  Page loaded, initial elements: ${initialCount}`);
+  console.error(`  Page: ${pageState.url}`);
+  console.error(`  Elements: ${pageState.liCount} <li>, headings: [${pageState.headings.join(' | ')}]`);
+  console.error(`  Body: ${pageState.bodyPreview}`);
+  
+  // Retry: if page looks empty, wait longer and try again
+  if (pageState.liCount < 5) {
+    console.error(`  ⚠️ Page sparse (${pageState.liCount} <li>), waiting 10s more...`);
+    await listPage.waitForTimeout(10000);
+    const retryState = await listPage.evaluate(() => ({
+      liCount: document.querySelectorAll('li').length,
+      body: (document.body?.innerText || '').substring(0, 200)
+    }));
+    console.error(`  Retry: ${retryState.liCount} <li>, body: ${retryState.body}`);
+  }
 
   const jobs = [];
   const seen = new Set();
@@ -529,6 +549,17 @@ async function main() {
   }
 
   console.log(`\nDone.`);
+
+  // ── Run Status Summary ──
+  const status = [];
+  status.push(jobs.length > 0 ? `✅ Scraped ${jobs.length} jobs` : `❌ Scraped 0 jobs (LinkedIn may have blocked or page changed)`);
+  status.push(newST > 0 ? `✅ ${newST} new ST users confirmed` : `⚪ No new ST users today`);
+  status.push(newAZ > 0 ? `🚨 ${newAZ} in Arizona` : `⚪ No AZ companies`);
+  status.push(blacklisted > 0 ? `🚫 ${blacklisted} blacklisted` : `⚪ None blacklisted`);
+  if (WEBHOOK_URL) status.push(`📧 Webhook sent`);
+
+  console.log(`\n=== STATUS ===`);
+  status.forEach(s => console.log(s));
 }
 
 main().catch(err => {
