@@ -1,0 +1,12 @@
+{
+  "schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "npx playwright install chromium && npx playwright install-deps chromium && npm install"
+  },
+  "deploy": {
+    "startCommand": "node scripts/scrape-daily.js",
+    "restartPolicyType": "NEVER",
+    "numReplicas": 1
+  }
+}

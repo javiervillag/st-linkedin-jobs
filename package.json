@@ -1,0 +1,18 @@
+{
+  "name": "az-servicetitan-lead-gen",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Autonomous pipeline to build Arizona ServiceTitan user lead database",
+  "dependencies": {
+    "@playwright/test": "^1.60.0",
+    "xlsx": "^0.18.5"
+  },
+  "scripts": {
+    "discover-websites": "node scripts/discover-websites.js",
+    "detect-servicetitan": "node scripts/detect-servicetitan.js",
+    "enrich-contacts": "node scripts/enrich-contacts.js",
+    "verify-emails": "node scripts/verify-emails.js",
+    "scrape-linkedin": "node scripts/scrape-daily.js",
+    "daily": "node scripts/scrape-daily.js"
+  }
+}
