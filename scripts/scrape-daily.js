@@ -209,35 +209,92 @@ async function main() {
   await listPage.goto('https://www.linkedin.com', { waitUntil: 'domcontentloaded', timeout: 15000 });
   await listPage.waitForTimeout(2000 + Math.random() * 2000);
 
-  // Navigate to actual search — wait longer for dynamic job list to render
-  await listPage.goto(SEARCH_URL, { waitUntil: 'load', timeout: 30000 });
+  // Navigate to search
+  console.error(`  Navigating to: ${SEARCH_URL}`);
+  
+  let pageResponse;
+  try {
+    pageResponse = await listPage.goto(SEARCH_URL, { waitUntil: 'load', timeout: 30000 });
+  } catch (navErr) {
+    console.error(`  ❌ NAVIGATION FAILED: ${navErr.message}`);
+    console.error(`  URL: ${SEARCH_URL}`);
+    console.error(`  Possible: network timeout, DNS failure, or LinkedIn blocking request`);
+  }
+  
+  if (pageResponse) {
+    console.error(`  HTTP: ${pageResponse.status()} ${pageResponse.statusText()}`);
+    if (pageResponse.status() >= 400) {
+      console.error(`  ❌ BLOCKED or ERROR: HTTP ${pageResponse.status()}`);
+    }
+  }
+  
   await listPage.waitForTimeout(5000 + Math.random() * 3000);
   
-  // Verify page loaded with content — capture page state for debugging
+  // Capture console errors from the page (LinkedIn JS errors, block messages)
+  const pageErrors = [];
+  listPage.on('console', msg => {
+    if (msg.type() === 'error') pageErrors.push(msg.text().substring(0, 200));
+  });
+  listPage.on('pageerror', err => pageErrors.push(err.message.substring(0, 200)));
+  
+  // Full page state diagnostic
   const pageState = await listPage.evaluate(() => {
     const items = document.querySelectorAll('li');
     const headings = document.querySelectorAll('h1, h2');
-    const bodySnippet = (document.body?.innerText || '').substring(0, 300);
+    const bodyText = (document.body?.innerText || '').substring(0, 500);
+    const title = document.title;
+    const url = window.location.href;
+    
+    // Check for common LinkedIn block messages
+    const blockedPhrases = ['unusual activity', 'verify', 'security check', 'captcha', 'sign in', 'log in', 'access denied'];
+    const maybeBlocked = blockedPhrases.some(p => bodyText.toLowerCase().includes(p));
+    
+    // Check for job list elements specifically
+    const jobCards = document.querySelectorAll('[class*="job"], [class*="result"], [class*="card"]');
+    const hasH1 = !!document.querySelector('h1');
+    
     return {
+      url,
+      title,
       liCount: items.length,
       headings: Array.from(headings).map(h => h.innerText).filter(Boolean),
-      bodyPreview: bodySnippet,
-      url: window.location.href
+      bodyPreview: bodyText,
+      maybeBlocked,
+      jobCardElements: jobCards.length,
+      hasH1,
+      htmlLength: document.documentElement.outerHTML.length
     };
   });
-  console.error(`  Page: ${pageState.url}`);
-  console.error(`  Elements: ${pageState.liCount} <li>, headings: [${pageState.headings.join(' | ')}]`);
-  console.error(`  Body: ${pageState.bodyPreview}`);
   
-  // Retry: if page looks empty, wait longer and try again
+  console.error(`  ┌─ Page Diagnostic ─────────────────────────────`);
+  console.error(`  │ URL:      ${pageState.url}`);
+  console.error(`  │ Title:    "${pageState.title}"`);
+  console.error(`  │ HTML:     ${pageState.htmlLength} bytes`);
+  console.error(`  │ <li>:     ${pageState.liCount} | job cards: ${pageState.jobCardElements} | h1: ${pageState.hasH1}`);
+  console.error(`  │ Headings: ${pageState.headings.join(' · ')}`);
+  console.error(`  │ Blocked?  ${pageState.maybeBlocked ? '⚠️ YES — page shows security/block message' : 'no'}`);
+  console.error(`  │ Body:     ${pageState.bodyPreview.substring(0, 120)}`);
+  if (pageErrors.length > 0) {
+    console.error(`  │ JS errors: ${pageErrors.slice(0, 3).join(' | ')}`);
+  }
+  console.error(`  └───────────────────────────────────────────────`);
+  
+  // Retry if page looks empty
   if (pageState.liCount < 5) {
-    console.error(`  ⚠️ Page sparse (${pageState.liCount} <li>), waiting 10s more...`);
-    await listPage.waitForTimeout(10000);
-    const retryState = await listPage.evaluate(() => ({
-      liCount: document.querySelectorAll('li').length,
-      body: (document.body?.innerText || '').substring(0, 200)
-    }));
-    console.error(`  Retry: ${retryState.liCount} <li>, body: ${retryState.body}`);
+    console.error(`  ⚠️ Page sparse (${pageState.liCount} <li>).`);
+    if (pageState.maybeBlocked) {
+      console.error(`  🛑 LinkedIn appears to be blocking — security/verify page detected.`);
+      console.error(`  Suggestions: use residential proxy, reduce frequency, or switch IP`);
+    } else {
+      console.error(`  Waiting 15s for delayed rendering...`);
+      await listPage.waitForTimeout(15000);
+      const retryState = await listPage.evaluate(() => ({
+        liCount: document.querySelectorAll('li').length,
+        body: (document.body?.innerText || '').substring(0, 200),
+        title: document.title
+      }));
+      console.error(`  Retry: ${retryState.liCount} <li>, title: "${retryState.title}", body: ${retryState.body.substring(0, 100)}`);
+    }
   }
 
   const jobs = [];
